@@ -1,4 +1,6 @@
-# Windows 批处理必须保持 CRLF，否则 cmd 解析会出错
-*.bat text eol=crlf
+# Windows 批处理必须保持 CRLF + GBK 原始字节，否则 cmd 解析会错乱
+# 用 -text（二进制）而不是 eol=crlf：后者会把仓库里的内容存成 LF，
+# 从 GitHub 直接下载 ZIP 时拿到的还是 LF 版本，一样会坏。
+*.bat -text
 *.js text eol=lf
 *.md text eol=lf
