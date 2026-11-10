@@ -1,0 +1,4 @@
+# Windows 批处理必须保持 CRLF，否则 cmd 解析会出错
+*.bat text eol=crlf
+*.js text eol=lf
+*.md text eol=lf
