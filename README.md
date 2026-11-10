@@ -1,6 +1,6 @@
 # WorkBuddy 字体 & 配色定制器
 
-把 WorkBuddy 桌面端的界面字体换成你指定的任意字体，并可切换为 **Claude 暖色配色**（暖米白纸感 + 墨色文字 + 橙棕点缀）。
+把 WorkBuddy 桌面端的界面字体换成你指定的任意字体，可切换 **Claude 暖色配色**（暖米白纸感 + 墨色文字 + 橙棕点缀），并可调整**界面字重**（light / regular / medium / bold）。
 
 > 缘起：官方设置只能调字号、改不了字体样式，于是写了个脚本直接把字体"焊"进程序里。后来又想把配色改成 Obsidian 上 Claude 主题的暖色调，一并做了。这里把它做成了通用版，任何人都能用。
 
@@ -12,7 +12,8 @@ WorkBuddy 是基于 Electron 的桌面应用，界面字体和配色硬编码在
 2. **解析 `app.asar`**：自包含解析逻辑，**零第三方依赖**，只要有 Node.js 就能跑；
 3. **字体**：把指定字体名插到界面字体栈最前面；
 4. **配色**：在设计 token 主文件末尾追加一段 light 主题的变量覆盖；
-5. **重新打包**：同步重算被改文件的 `integrity` 校验值，自动备份原文件。
+5. **字重**：覆盖 `--wb-font-weight-400/500/600/700` 四个基准 token（其余语义 token 都引用它们）；
+6. **重新打包**：同步重算被改文件的 `integrity` 校验值，自动备份原文件。
 
 **只改「界面 UI 字体」**，代码区/等宽字体不受影响（代码保持等宽，不会变楷体）。
 
@@ -48,20 +49,29 @@ WorkBuddy 是基于 Electron 的桌面应用，界面字体和配色硬编码在
 [5] 查字体真实名字（改了没效果时先用这个）
 ```
 
-- **首次使用**：选 `1`，输入字体名，配色那步按需选 `y`/`n`。脚本会**自动**先关校验开关再改字体配色，不需要分两步。
+- **首次使用**：选 `1`，按提示走三步——输入字体名 → 选配色 → 选字重（直接回车 = 不改）。脚本会**自动**先关校验开关再改界面，不需要分两步。
 - **WorkBuddy 更新后**：选 `2`，用记住的选择一键恢复，全程无交互。
-- **恢复默认**：选 `4`，把字体、配色、exe 校验开关一次性全还原。
+- **恢复默认**：选 `4`，把字体、配色、字重、exe 校验开关一次性全还原。
 
 > ⚠ 改字体/恢复前**记得先完全退出 WorkBuddy**（托盘图标右键 → 退出，不是关窗口）。文件被占用时脚本会直接停手，不会破坏任何文件。
 
 ### 方式二：命令行
 
 ```bash
-# 换字体（会问要不要同时改配色）
+# 换字体（会依次问：要不要配色、要不要调字重）
 node workbuddy-font-patcher.js "仓耳今楷03"
 
 # 换多个字体（第一个优先，找不到就回退到第二个）
 node workbuddy-font-patcher.js "霞鹜文楷, LXGW WenKai"
+
+# 换字体 + 指定字重
+node workbuddy-font-patcher.js "Microsoft YaHei" --weight light
+
+# 只调字重（字体名那步直接回车跳过）
+node workbuddy-font-patcher.js --weight bold
+
+# 恢复官方字重（清除已注入的字重块）
+node workbuddy-font-patcher.js --weight regular
 
 # 试运行：只生成新 asar，不替换、不动 exe
 node workbuddy-font-patcher.js dry "LXGW WenKai"
@@ -72,7 +82,7 @@ node workbuddy-font-patcher.js check
 # 更新后一键恢复：用记住的设置，全程无交互
 node workbuddy-font-patcher.js auto
 
-# 总还原：把字体、配色、程序文件全部恢复成官方原样
+# 总还原：把字体、配色、字重、程序文件全部恢复成官方原样
 node workbuddy-font-patcher.js restore
 ```
 
@@ -148,10 +158,55 @@ node font-resolver.js 仓耳      # 或双击工具箱选 [5]
 
 挂载点按内容特征自动识别（找定义 `--wb-palette-brand-8` 的 CSS），官方改文件名也不会失效。
 
+## 字重（light / regular / medium / bold）
+
+WorkBuddy 的字重走一套语义 token，全部定义在 `:root` 里，且层层引用四个基准档：
+
+```
+--wb-font-weight-400 / 500 / 600 / 700
+        ↓ var() 引用
+--wb-font-body-weight、--wb-font-caption-weight、--wb-font-h1..h3-weight、
+--wb-modal-*、--wb-table-font-weight、--wb-pagination-font-weight ……
+```
+
+所以只需在 token 文件末尾覆盖这四个基准档，整个界面字重就跟着变，不用改 3000 多处 `font-weight` 声明。
+
+| 预设 | 正文 | 中等强调 | 标题/加粗 |
+|---|---|---|---|
+| `light` | 300 | 400 | 700 |
+| `regular` | 400 | 500 | 600（官方原样，用于清除补丁） |
+| `medium` | 500 | 500 | 700 |
+| `bold` | 700 | 700 | 700 |
+
+### 前提：字体必须真的带这些字重
+
+`font-weight` 只能**选**字体里真实存在的字面，浏览器**不会**合成更细的字重。实测（Chrome 无头渲染，统计字形墨迹覆盖像素）：
+
+| 字体 | 100–300 | 400–500 | 600–900 | 结论 |
+|---|---|---|---|---|
+| SimHei 黑体 | 16002 | 16002 | 23386 | 只有 1 档 → `light` 无效，`bold` 是伪粗体 |
+| Microsoft YaHei | 13193 | 18678 | 29021 | 3 档真实字面，三档都能选 |
+| DengXian 等线 | 9566 | 12946 | 19091 | 3 档真实 |
+| 霞鹜文楷 | 10575 | 12789 / 15405 | 19568 | Light/Regular/Medium 真实，粗体为合成 |
+| 仓耳今楷03 | 11698 | 14200 | 20560 | 5 个文件都是 400 → 只有 1 档 + 伪粗体 |
+
+脚本会在动手前读目标字体的 `OS/2.usWeightClass` 校验，缺字重时直接警告：
+
+```
+⚠ 「SimHei」没有 300 字重（已装：400 Regular）
+  浏览器不会合成更细的字重 → 正文实际仍显示 400，light 效果不会出现
+⚠ 「SimHei」没有 700 粗体字面 → 标题/强调会用浏览器合成的伪粗体（CJK 笔画会发糊）
+```
+
+想真正用上 light/bold，请换多字重字体（系统自带的微软雅黑、等线就有 300/400/700）。
+查某个字体装了几档字重：`node font-resolver.js 微软雅黑`。
+
+> 注：仓耳今楷03 的 W01~W05 是 5 种不同**设计**，`usWeightClass` 全部是 400，不是 5 档字重，靠 `font-weight` 选不中指定那一款。
+
 ## 还原与更新
 
 - **改完需要重启 WorkBuddy 才生效。**
-- **官方更新会覆盖补丁**——字体、配色、校验开关都会被恢复原样，这是程序决定的，工具无法提前预防。更新后跑一次 `2` 即可。
+- **官方更新会覆盖补丁**——字体、配色、字重、校验开关都会被恢复原样，这是程序决定的，工具无法提前预防。更新后跑一次 `2` 即可。
 - 备份位置：
   - `resources/app.asar.backup`（原始 asar）
   - `WorkBuddy.exe.backup`（原始 exe，含校验开关状态）
@@ -173,6 +228,12 @@ node font-resolver.js 仓耳      # 或双击工具箱选 [5]
 **Q：程序打不开，提示被占用**
 WorkBuddy 没完全退出。托盘图标右键 → 退出，再重试。
 
+**Q：设了 `--weight light` 但看不出变化**
+字体只有一档字重（如 SimHei、仓耳今楷03）。浏览器不会合成更细的字重，请求 300 仍渲染 400 字形。换多字重字体（微软雅黑 / 等线 / 霞鹜文楷），或改用 `--weight bold`。脚本在打补丁前会直接警告这种情况。
+
+**Q：字重变粗了但笔画发糊**
+该字体没有对应的粗体字面，浏览器用了伪粗体（描边合成）。这不是 bug，只能换带真粗体的字体。
+
 **Q：想自己深入定位（只读）**
 
 ```bash
@@ -187,12 +248,22 @@ node tools/fuse-check.js   # exe 的 fuse 开关逐项状态
 | `wb-toolbox.bat` | **唯一入口**：双击后弹菜单，5 个常用操作全包了 |
 | `workbuddy-font-patcher.js` | 核心脚本（纯 Node，零依赖） |
 | `find-workbuddy.js` | 安装位置探测：常见路径 + 注册表登记目录，支持自定义安装目录 |
+| `font-meta.js` | 字体元数据：解析 name / OS/2 表，支持 `.ttc` 集合，查某家族装了几档字重 |
 | `workbuddy-fuse-tool.js` | 校验开关专用工具（status / off / on / restore） |
-| `font-resolver.js` | 查字体名：区分 ★浏览器用名 与 ⚠GDI注册表名 |
+| `font-resolver.js` | 查字体名与字重：区分 ★浏览器用名 与 ⚠GDI注册表名 |
 | `tools/asar-probe.js` | asar 结构诊断（只读） |
 | `tools/fuse-check.js` | fuse 校验开关探测（只读） |
 
 ## 更新日志
+
+### v4.3
+
+新增**字重选择**（`--weight light|regular|medium|bold`）：
+
+- 通过覆盖 `--wb-font-weight-400/500/600/700` 四个基准 token 整体改界面字重，其余语义 token 自动跟随，不需要改 3000 多处声明。
+- 打补丁前读取目标字体的 `OS/2.usWeightClass` 校验，缺字重时警告并说明实际会发生什么（回退到哪一档 / 是否伪粗体），需确认才继续。
+- 新增 `font-meta.js`：解析 name / OS/2 表，**支持 `.ttc` 集合**（微软雅黑等系统字体就是 ttc，之前查不到）。
+- `font-resolver.js` 改用同一套解析，输出每个家族实际装了几档字重；`check` 增加字重补丁状态；`auto` / `restore` 一并处理字重设置。
 
 ### v4.2
 

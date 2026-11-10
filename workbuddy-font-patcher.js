@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * WorkBuddy 字体 & 配色补丁工具（通用版 v3.1）
- * 把 WorkBuddy 桌面端界面字体改成你指定的任意字体，并可切换为 Claude 暖色配色。
+ * WorkBuddy 字体 & 配色 & 字重补丁工具
+ * 把 WorkBuddy 桌面端界面字体改成你指定的任意字体，可切换 Claude 暖色配色，并可调整界面字重。
  * （先确保字体已安装到系统）
  *
  * 用法：
@@ -12,10 +12,19 @@
  *   node workbuddy-font-patcher.js auto         更新后一键恢复（用记住的设置，无交互）
  *   node workbuddy-font-patcher.js dry "字体名"  试运行，生成新文件但不替换
  *
+ * 字重（可选参数，可与上面任意用法组合）：
+ *   --weight light|regular|medium|bold
+ *     light   正文 300 / 强调 700（需要字体真的带 Light 字面，否则无效）
+ *     regular 恢复官方字重（同时清除已注入的字重补丁）
+ *     medium  正文 500 / 强调 700
+ *     bold    正文 700 / 强调 700
+ *   注意：font-weight 只能"选"字体里真实存在的字面。单字重字体（如 SimHei）没有 Light，
+ *   浏览器也不会合成更细的字重；缺 Bold 时浏览器会用伪粗体（笔画发糊）。
+ *
  * 说明：
  *   - 零第三方依赖，纯 Node.js 实现（不需要 npm install）。
- *   - 原理：WorkBuddy 界面字体/配色硬编码在其安装目录的 app.asar 里，本脚本把其中
- *     的字体栈前面加上你指定的字体，并在设计 token 文件末尾追加配色覆盖，再重新打包。
+ *   - 原理：WorkBuddy 界面字体/配色/字重硬编码在其安装目录的 app.asar 里，本脚本把其中
+ *     的字体栈前面加上你指定的字体，并在设计 token 文件末尾追加配色/字重覆盖，再重新打包。
  *   - 必须先完全退出 WorkBuddy 再运行本脚本，否则文件被占用、且要重启才生效。
  *   - 改的是"界面 UI 字体"（正文、对话、侧边栏等）；代码/等宽字体不受影响。
  *   - WorkBuddy 升级更新后修改会被覆盖，重新跑一次即可。
@@ -72,11 +81,13 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
-const VERSION = '4.2';
+const VERSION = '4.3';
 
 // ==================== 1. 定位 WorkBuddy 的 app.asar ====================
 // 支持自定义安装目录：常见路径 → 注册表登记目录（详见 find-workbuddy.js）
 const { findAppAsar, findExeFromAsar } = require('./find-workbuddy');
+// 字体元数据：查某个家族实际装了几档字重（详见 font-meta.js）
+const { getFamilyWeights, weightLabel } = require('./font-meta');
 
 // ==================== 1b. Electron fuse（asar 完整性校验开关）====================
 const FUSE_SENTINEL = 'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX';
@@ -387,6 +398,7 @@ function verifyFontName(name) {
 // 补丁标记：写进 index.html，用于识别"当前 app.asar 是否已被本工具改过"
 const MARK = 'wb-font-patched';
 const THEME_MARK = 'wb-claude-theme';
+const WEIGHT_MARK = 'wb-font-weight';
 
 // ==================== 4. Claude Warm 配色 ====================
 // 说明：
@@ -434,9 +446,85 @@ function isTokenCss(filePath, content) {
   return /^(?:renderer\/)?assets\/.*\.css$/.test(filePath) && /--wb-palette-brand-8\s*:/.test(content);
 }
 
+// ==================== 4b. 字重覆盖 ====================
+// 背景：WorkBuddy 的字重走一套语义化 token（定义在 :root 里，均在 token 主文件中）：
+//   --wb-font-weight-400/500/600/700 是四个基准档，其余语义 token（body / caption / h1..h3 /
+//   modal / table / pagination ...）全部 var() 引用它们。所以只要覆盖这四个基准档，
+//   整个界面字重就会跟着变，不需要改 3000 多处 font-weight 声明。
+//
+// 重要限制：font-weight 只能"选"字体里真实存在的字面，浏览器不会合成更细的字重。
+//   单字重字体（如 SimHei）请求 300 仍渲染 400 字形；请求 700 则是合成粗体（笔画发糊）。
+//   所以打补丁前必须先校验目标字体装了哪些字重，见 verifyWeight()。
+const WEIGHT_PRESETS = {
+  light:   { body: 300, medium: 400, strong: 700 },
+  regular: { body: 400, medium: 500, strong: 600 },   // 官方原样，用于清除字重补丁
+  medium:  { body: 500, medium: 500, strong: 700 },
+  bold:    { body: 700, medium: 700, strong: 700 },
+};
+
+function buildWeightCss(preset) {
+  return `
+/* ${WEIGHT_MARK} 字重覆盖（正文 ${preset.body} / 强调 ${preset.strong}，由 workbuddy-font-patcher 注入） */
+:root {
+  --wb-font-weight-400: ${preset.body};
+  --wb-font-weight-500: ${preset.medium};
+  --wb-font-weight-600: ${preset.strong};
+  --wb-font-weight-700: ${preset.strong};
+  --wb-font-body-weight: ${preset.body};
+  --wb-font-body-strong-weight: ${preset.strong};
+  --wb-font-caption-weight: ${preset.body};
+  --wb-font-display-weight: ${preset.strong};
+}
+`;
+}
+
+// 从命令行读取 --weight 参数，返回 light/regular/medium/bold 或 null
+function parseWeightOption(argv) {
+  const i = argv.indexOf('--weight');
+  if (i < 0) return null;
+  const v = (argv[i + 1] || '').toLowerCase();
+  if (WEIGHT_PRESETS[v]) return v;
+  return null;
+}
+
+// 校验：目标字体是否真的装了想要的字重；返回提示文案数组
+function verifyWeight(fontName, presetName) {
+  const preset = WEIGHT_PRESETS[presetName];
+  if (!preset || presetName === 'regular') return [];
+  const weights = getFamilyWeights(fontName);
+  if (!weights) return [];   // 字体没查到（可能没装），字体校验那步会另行提示
+
+  const msgs = [];
+  const has = w => weights.some(x => Math.abs(x - w) <= 20);  // 容差：290 视为 300
+  if (!has(preset.body)) {
+    const nearest = weights.reduce((a, b) => Math.abs(b - preset.body) < Math.abs(a - preset.body) ? b : a);
+    msgs.push(`「${fontName}」没有 ${preset.body} 字重（已装：${weights.map(weightLabel).join(' / ')}）`);
+    if (preset.body < 400) {
+      msgs.push(`  浏览器不会合成更细的字重 → 正文实际仍显示 ${nearest}，light 效果不会出现`);
+    } else {
+      msgs.push(`  正文会回退到最近的 ${nearest}，效果与预期不同`);
+    }
+  }
+  if (!has(preset.strong) && preset.strong >= 600) {
+    msgs.push(`「${fontName}」没有 ${preset.strong} 粗体字面 → 标题/强调会用浏览器合成的伪粗体（CJK 笔画会发糊）`);
+  }
+  return msgs;
+}
+
+// 去掉 CSS 末尾本工具注入的块（配色 / 字重），返回干净基底
+function stripPatchedBlocks(css) {
+  const marks = ['/* ' + THEME_MARK, '/* ' + WEIGHT_MARK];
+  let cut = -1;
+  for (const m of marks) {
+    const i = css.indexOf(m);
+    if (i >= 0 && (cut < 0 || i < cut)) cut = i;
+  }
+  return cut >= 0 ? css.slice(0, cut).replace(/\s+$/, '') : css;
+}
+
 // ==================== 5. 检测当前 asar 是否已被本工具打过补丁 ====================
 function detectPatched(h, entries) {
-  const found = { font: false, theme: [], tokenFile: [] };
+  const found = { font: false, theme: [], weight: [], tokenFile: [] };
   const ih = entries.find(e => e.path === 'renderer/index.html');
   if (ih) {
     const b = readEntry(h, ih.node);
@@ -448,7 +536,8 @@ function detectPatched(h, entries) {
     if (!b) continue;
     const s = b.toString('utf8');
     if (isTokenCss(e.path, s)) found.tokenFile.push(e.path);
-    if (s.includes(THEME_MARK)) found.theme.push(e.path);
+    if (s.includes('/* ' + THEME_MARK)) found.theme.push(e.path);
+    if (s.includes('/* ' + WEIGHT_MARK)) found.weight.push(e.path);
   }
   return found;
 }
@@ -501,24 +590,26 @@ function relOf(root, p) { return path.relative(root, p).replace(/\\/g, '/'); }
 function scanUnpacked(rendererDir) {
   const { bakRenderer } = unpackedPaths(rendererDir);
   const files = walkFiles(rendererDir, p => /\.(css|html)$/i.test(p));
-  const token = [], themed = [];
+  const token = [], themed = [], weighted = [];
   for (const f of files) {
     const rel = relOf(rendererDir, f);
     let s = ''; try { s = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
     if (isTokenCss(rel, s)) token.push(rel);
-    if (s.includes(THEME_MARK)) themed.push(rel);
+    if (s.includes('/* ' + THEME_MARK)) themed.push(rel);
+    if (s.includes('/* ' + WEIGHT_MARK)) weighted.push(rel);
   }
   let idxMarked = false;
   try { idxMarked = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8').includes(MARK); } catch (e) { }
-  return { files, token, themed, idxMarked, bakExists: fs.existsSync(bakRenderer) };
+  return { files, token, themed, weighted, idxMarked, bakExists: fs.existsSync(bakRenderer) };
 }
 
-function applyUnpacked(rendererDir, F, doTheme, DRY) {
+function applyUnpacked(rendererDir, F, doTheme, DRY, weightCss) {
   const { bakRoot, bakRenderer, stateFile } = unpackedPaths(rendererDir);
   const patcher = F ? makePatcher(F) : null;
   const files = walkFiles(rendererDir, p => /\.(css|html)$/i.test(p));
   const plan = [];
   const themeFiles = [];
+  const weightFiles = [];
   let fontFiles = 0;
 
   for (const f of files) {
@@ -535,11 +626,12 @@ function applyUnpacked(rendererDir, F, doTheme, DRY) {
       out = patcher(out);
       if (out !== before) fontFiles++;
     }
-    if (doTheme && isTokenCss(rel, out)) {
-      const idx = out.indexOf('/* ' + THEME_MARK);
-      if (idx >= 0) out = out.slice(0, idx).replace(/\s+$/, '');
-      out = out + '\n' + CLAUDE_THEME_CSS;
-      themeFiles.push(rel);
+    // 配色 / 字重都挂在 token 主文件上：先剥掉旧块再按本次选择重建
+    if ((doTheme || weightCss !== undefined) && isTokenCss(rel, out)) {
+      let css = stripPatchedBlocks(out);
+      if (doTheme) { css = css + '\n' + CLAUDE_THEME_CSS; themeFiles.push(rel); }
+      if (weightCss) { css = css + '\n' + weightCss; weightFiles.push(rel); }
+      out = css;
     }
     if (rel === 'index.html' && !out.includes(MARK)) {
       if (out.includes('</style>')) out = out.replace('</style>', '/* ' + MARK + ' */</style>');
@@ -548,7 +640,7 @@ function applyUnpacked(rendererDir, F, doTheme, DRY) {
     if (out !== cur) plan.push({ f, rel, bak, out });
   }
 
-  if (DRY) return { plan, fontFiles, themeFiles, total: files.length, written: 0 };
+  if (DRY) return { plan, fontFiles, themeFiles, weightFiles, total: files.length, written: 0 };
 
   let written = 0;
   for (const p of plan) {
@@ -571,12 +663,12 @@ function applyUnpacked(rendererDir, F, doTheme, DRY) {
     fs.mkdirSync(bakRoot, { recursive: true });
     fs.writeFileSync(stateFile, JSON.stringify({
       mode: 'unpacked', patchedAt: new Date().toISOString(),
-      font: F ? F.trim() : '', theme: !!doTheme,
+      font: F ? F.trim() : '', theme: !!doTheme, weight: weightCss ? true : false,
       files: plan.map(p => p.rel),
     }, null, 2), 'utf8');
   } catch (e) { }
 
-  return { plan, fontFiles, themeFiles, total: files.length, written };
+  return { plan, fontFiles, themeFiles, weightFiles, total: files.length, written };
 }
 
 function restoreUnpacked(rendererDir) {
@@ -594,7 +686,7 @@ function restoreUnpacked(rendererDir) {
   return { ok: true, restored };
 }
 
-async function runUnpacked(rendererDir, arg) {
+async function runUnpacked(rendererDir, arg, fontArg) {
   const DRY = arg === 'dry';
   const AUTO = arg === 'auto' || arg === 'restore-config';
   const cfg = loadConfig();
@@ -608,13 +700,13 @@ async function runUnpacked(rendererDir, arg) {
       console.log('· 没找到补丁备份，当前就是官方原版，无需还原。');
       process.exit(0);
     }
-    console.log('将把界面字体 / 配色恢复为官方默认。');
+    console.log('将把界面字体 / 配色 / 字重恢复为官方默认。');
     if (!FORCE) {
       const ok = await ask('确定还原吗？(y/n)：');
       if (!ok || !ok.toLowerCase().startsWith('y')) { console.log('已取消，未做任何修改。'); process.exit(0); }
     }
     const r = restoreUnpacked(rendererDir);
-    try { const c = loadConfig(); delete c.font; delete c.theme; saveConfig(c); } catch (e) { }
+    try { const c = loadConfig(); delete c.font; delete c.theme; delete c.weight; saveConfig(c); } catch (e) { }
     console.log('✓ 已还原 ' + r.restored + ' 个文件为官方原版');
     console.log('  请重新打开 WorkBuddy。');
     process.exit(0);
@@ -628,6 +720,7 @@ async function runUnpacked(rendererDir, arg) {
     console.log('token 主文件   : ' + (st.token.length ? st.token.join(', ') : '❌ 未找到（配色会失效）'));
     console.log('字体补丁状态   : ' + (st.idxMarked ? '✅ 已打补丁' : '— 未打补丁（官方原版）'));
     console.log('配色补丁状态   : ' + (st.themed.length ? '✅ 已打补丁 → ' + st.themed.join(', ') : '— 未打补丁（官方原版）'));
+    console.log('字重补丁状态   : ' + (st.weighted.length ? '✅ 已打补丁 → ' + st.weighted.join(', ') : '— 未打补丁（官方原版）'));
     console.log('补丁备份       : ' + (st.bakExists ? '✅ 存在' : '— 不存在'));
     console.log('asar 校验开关  : — 无需处理（解包模式不动 asar，不触发校验）');
     process.exit(0);
@@ -653,18 +746,18 @@ async function runUnpacked(rendererDir, arg) {
   }
 
   // ---------- 取字体名 ----------
-  let fontInput = DRY ? (process.argv[3] || '') : arg;
+  let fontInput = DRY ? (fontArg || '') : arg;
   if (AUTO) {
     fontInput = cfg.font || '';
     console.log('[自动模式] 字体: ' + (fontInput || '不改'));
-    if (!fontInput && !cfg.theme) {
+    if (!fontInput && !cfg.theme && !cfg.weight) {
       console.error('\n✗ 没有记住任何设置。请先运行一次「改字体」设置。');
       process.exit(1);
     }
   }
   if (!fontInput) {
     const hint = cfg.font ? '（直接回车 = 用上次的「' + cfg.font + '」）' : '（直接回车 = 不改字体）';
-    fontInput = await ask('[1/2] 字体名' + hint + '：');
+    fontInput = await ask('[1/3] 字体名' + hint + '：');
     if (!fontInput.trim() && cfg.font) fontInput = cfg.font;
   }
   let F = null;
@@ -700,21 +793,56 @@ async function runUnpacked(rendererDir, arg) {
     console.log('[自动模式] 配色: ' + (doTheme ? 'Claude 暖色' : '不改'));
   } else {
     const tHint = cfg.theme === false ? '，直接回车 = 不改' : '，直接回车 = 改';
-    const ans = await ask('[2/2] 改成 Claude 暖色配色？(y/n' + tHint + ')：');
+    const ans = await ask('[2/3] 改成 Claude 暖色配色？(y/n' + tHint + ')：');
     if (ans && ans.trim()) doTheme = !ans.toLowerCase().startsWith('n');
     else doTheme = cfg.theme !== false;
   }
 
+  // ---------- 取字重选择 ----------
+  // weightOpt：null = 不处理；'regular' = 清除字重补丁；其它 = 应用对应预设
+  let weightOpt = parseWeightOption(process.argv);
+  if (AUTO) {
+    weightOpt = cfg.weight || null;
+    console.log('[自动模式] 字重: ' + (weightOpt || '不改'));
+  } else if (weightOpt === null && process.stdin.isTTY) {
+    const wHint = cfg.weight ? '（回车 = 用上次的「' + cfg.weight + '」）' : '（回车 = 不改）';
+    const wAns = (await ask('[3/3] 字重 light / regular / medium / bold' + wHint + '：')).toLowerCase();
+    if (wAns) {
+      if (WEIGHT_PRESETS[wAns]) weightOpt = wAns;
+      else console.log('  ⚠ 无法识别「' + wAns + '」，本次不改字重。');
+    } else if (cfg.weight) {
+      weightOpt = cfg.weight;
+    }
+  }
+  let weightCss;   // undefined = 不处理；'' = 清除旧块；字符串 = 应用
+  if (weightOpt) weightCss = weightOpt === 'regular' ? '' : buildWeightCss(WEIGHT_PRESETS[weightOpt]);
+
   console.log('----------------------------------------');
   console.log(F ? ('字体: ' + F.trim()) : '字体: 不改');
   console.log(doTheme ? '配色: 改为 Claude 暖色' : '配色: 不改');
-  if (!F && !doTheme) { console.log('未选择任何改动，退出。'); process.exit(0); }
+  if (weightOpt) console.log('字重: ' + (weightOpt === 'regular' ? '恢复官方默认' : weightOpt));
+  if (!F && !doTheme && weightOpt === null) { console.log('未选择任何改动，退出。'); process.exit(0); }
+
+  // ---------- 字重可行性校验 ----------
+  if (weightOpt && weightOpt !== 'regular' && fontInput && fontInput.trim()) {
+    const first = fontInput.split(/[,，;；]/).map(s => s.trim()).filter(Boolean)[0];
+    const warns = verifyWeight(first, weightOpt);
+    if (warns.length) {
+      console.log('');
+      warns.forEach(w => console.log('⚠ ' + w));
+      if (!process.argv.includes('--force') && !process.argv.includes('-y') && !AUTO) {
+        const go = await ask('  仍要继续吗？(y = 继续 / 直接回车 = 取消)：');
+        if (!go || !go.toLowerCase().startsWith('y')) { console.log('  已取消，未做任何修改。'); process.exit(0); }
+      }
+    }
+  }
 
   // ---------- 执行 ----------
-  const r = applyUnpacked(rendererDir, F, doTheme, DRY);
+  const r = applyUnpacked(rendererDir, F, doTheme, DRY, weightCss);
   console.log('共 ' + r.total + ' 个 css/html 文件');
   if (F) console.log('字体已修改: ' + r.fontFiles + ' 个文件');
   if (doTheme) console.log('配色挂载点: ' + (r.themeFiles.length ? r.themeFiles.join(', ') : '❌ 未找到'));
+  if (weightCss !== undefined) console.log('字重挂载点: ' + (r.weightFiles.length ? r.weightFiles.join(', ') : '❌ 未找到'));
 
   if (DRY) {
     console.log('\n[dry-run] 计划修改 ' + r.plan.length + ' 个文件，未写入：');
@@ -728,17 +856,35 @@ async function runUnpacked(rendererDir, arg) {
     process.exit(0);
   }
 
-  saveConfig({ font: F ? fontInput.trim() : '', theme: doTheme, savedAt: new Date().toISOString() });
+  saveConfig({
+    font: F ? fontInput.trim() : '',
+    theme: doTheme,
+    weight: weightOpt || '',
+    savedAt: new Date().toISOString(),
+  });
   console.log('\n✓ 完成！已写入 ' + r.written + ' 个文件，请重新打开 WorkBuddy。');
   console.log('  备份在 ' + unpackedPaths(rendererDir).bakRoot);
   console.log('  还原：运行 restore 或工具箱选 [4]');
 }
 
+// 从命令行参数里取出"位置参数"（命令 / 字体名），跳过 --weight 这类开关及其取值
+function positionalArgs(argv) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--weight') { i++; continue; }   // 跳过 --weight 和它的值
+    if (a.startsWith('-')) continue;           // --force / -y / --unsafe
+    out.push(a);
+  }
+  return out;
+}
+
 // ==================== 7. 主流程 ====================
 (async function main() {
-  const arg = process.argv[2] || '';
+  const positional = positionalArgs(process.argv.slice(2));
+  const arg = positional[0] || '';
   const DRY = arg === 'dry';
-  const fontArg = DRY ? (process.argv[3] || '') : arg;
+  const fontArg = DRY ? (positional[1] || '') : arg;
 
   console.log('WorkBuddy 字体 & 配色补丁工具 v' + VERSION);
   console.log('----------------------------------------');
@@ -757,7 +903,7 @@ async function runUnpacked(rendererDir, arg) {
   if (unpackedRenderer) {
     console.log('资源模式      : 解包（新版结构，直接改磁盘文件，不动 asar / exe）');
     console.log('资源目录      :', unpackedRenderer);
-    await runUnpacked(unpackedRenderer, arg);
+    await runUnpacked(unpackedRenderer, arg, fontArg);
     return;
   }
 
@@ -824,7 +970,7 @@ async function runUnpacked(rendererDir, arg) {
     try {
       const cfg = loadConfig();
       if (cfg.font || cfg.theme) {
-        delete cfg.font; delete cfg.theme;
+        delete cfg.font; delete cfg.theme; delete cfg.weight;
         saveConfig(cfg);
         console.log('✓ 已清除记住的字体 / 配色设置');
       }
@@ -848,6 +994,7 @@ async function runUnpacked(rendererDir, arg) {
     console.log('token 主文件   : ' + (stat.tokenFile.length ? stat.tokenFile.join(', ') : '❌ 未找到（配色会失效）'));
     console.log('字体补丁状态   : ' + (stat.font ? '✅ 已打补丁' : '— 未打补丁（官方原版）'));
     console.log('配色补丁状态   : ' + (stat.theme.length ? '✅ 已打补丁 → ' + stat.theme.join(', ') : '— 未打补丁（官方原版）'));
+    console.log('字重补丁状态   : ' + (stat.weight.length ? '✅ 已打补丁 → ' + stat.weight.join(', ') : '— 未打补丁（官方原版）'));
     console.log('备份文件       : ' + (fs.existsSync(backup) ? '✅ 存在' : '❌ 不存在'));
     const exeC = findExeFromAsar(target);
     const fuseOn = exeC ? isAsarIntegrityOn(exeC) : null;
@@ -872,14 +1019,14 @@ async function runUnpacked(rendererDir, arg) {
   if (AUTO) {
     fontInput = cfg.font || '';
     console.log('[自动模式] 字体: ' + (fontInput || '不改'));
-    if (!fontInput && !cfg.theme) {
+    if (!fontInput && !cfg.theme && !cfg.weight) {
       console.error('\n✗ 没有记住任何设置。请先运行「改字体.bat」设置一次。');
       closeAsar(cur); process.exit(1);
     }
   }
   if (fontInput === undefined || fontInput === '') {
     const hint = cfg.font ? '（直接回车 = 用上次的「' + cfg.font + '」）' : '（直接回车 = 不改字体）';
-    fontInput = await ask('[1/2] 字体名' + hint + '：');
+    fontInput = await ask('[1/3] 字体名' + hint + '：');
     if (!fontInput.trim() && cfg.font) fontInput = cfg.font;
   }
   let F = null;
@@ -921,15 +1068,52 @@ async function runUnpacked(rendererDir, arg) {
     console.log('[自动模式] 配色: ' + (doTheme ? 'Claude 暖色' : '不改'));
   } else {
     const tHint = cfg.theme === false ? '，直接回车 = 不改' : '，直接回车 = 改';
-    const themeAns = await ask('[2/2] 改成 Claude 暖色配色？(y/n' + tHint + ')：');
+    const themeAns = await ask('[2/3] 改成 Claude 暖色配色？(y/n' + tHint + ')：');
     if (themeAns && themeAns.trim()) doTheme = !themeAns.toLowerCase().startsWith('n');
     else doTheme = cfg.theme !== false;
   }
 
+  // ---------- 交互：字重 ----------
+  // weightOpt：null = 不处理；'regular' = 清除字重补丁；其它 = 应用对应预设
+  let weightOpt = parseWeightOption(process.argv);
+  if (AUTO) {
+    weightOpt = cfg.weight || null;
+    console.log('[自动模式] 字重: ' + (weightOpt || '不改'));
+  } else if (weightOpt === null && process.stdin.isTTY) {
+    const wHint = cfg.weight ? '（回车 = 用上次的「' + cfg.weight + '」）' : '（回车 = 不改）';
+    const wAns = (await ask('[3/3] 字重 light / regular / medium / bold' + wHint + '：')).toLowerCase();
+    if (wAns) {
+      if (WEIGHT_PRESETS[wAns]) weightOpt = wAns;
+      else console.log('  ⚠ 无法识别「' + wAns + '」，本次不改字重。');
+    } else if (cfg.weight) {
+      weightOpt = cfg.weight;
+    }
+  }
+  let weightCss;   // undefined = 不处理；'' = 清除旧块；字符串 = 应用
+  if (weightOpt) weightCss = weightOpt === 'regular' ? '' : buildWeightCss(WEIGHT_PRESETS[weightOpt]);
+
   console.log('----------------------------------------');
   console.log(F ? ('字体: ' + F.trim()) : '字体: 不改');
   console.log(doTheme ? '配色: 改为 Claude 暖色' : '配色: 不改');
-  if (!F && !doTheme) { console.log('未选择任何改动，退出。'); closeAsar(cur); process.exit(0); }
+  if (weightOpt) console.log('字重: ' + (weightOpt === 'regular' ? '恢复官方默认' : weightOpt));
+  if (!F && !doTheme && weightOpt === null) { console.log('未选择任何改动，退出。'); closeAsar(cur); process.exit(0); }
+
+  // ---------- 字重可行性校验 ----------
+  if (weightOpt && weightOpt !== 'regular' && fontInput && fontInput.trim()) {
+    const first = fontInput.split(/[,，;；]/).map(s => s.trim()).filter(Boolean)[0];
+    const warns = verifyWeight(first, weightOpt);
+    if (warns.length) {
+      console.log('');
+      warns.forEach(w => console.log('⚠ ' + w));
+      if (!process.argv.includes('--force') && !process.argv.includes('-y') && !AUTO) {
+        const go = await ask('  仍要继续吗？(y = 继续 / 直接回车 = 取消)：');
+        if (!go || !go.toLowerCase().startsWith('y')) {
+          console.log('  已取消，未做任何修改。');
+          closeAsar(cur); process.exit(0);
+        }
+      }
+    }
+  }
 
   // ---------- 检查 / 关闭 asar 完整性校验开关 ----------
   // 新版 WorkBuddy 在 exe 里开了 Electron 的 EnableEmbeddedAsarIntegrityValidation，
@@ -983,7 +1167,7 @@ async function runUnpacked(rendererDir, arg) {
 
   // ---------- 决定基底：已打补丁就以备份为基底，避免重复叠加 ----------
   let base;
-  if (stat.font || stat.theme.length) {
+  if (stat.font || stat.theme.length || stat.weight.length) {
     if (fs.existsSync(backup)) {
       console.log('· 检测到已打过补丁 → 以原始备份为基底重新生成（不会重复叠加）');
       base = openAsar(backup);
@@ -1005,8 +1189,9 @@ async function runUnpacked(rendererDir, arg) {
   const entries = listEntries(base);
   const patcher = F ? makePatcher(F) : null;
 
-  let fontPatched = 0, themePatched = 0, totalModified = 0;
+  let fontPatched = 0, themePatched = 0, weightPatched = 0, totalModified = 0;
   const themeTargets = [];
+  const weightTargets = [];
   const packed = [];
 
   for (const e of entries) {
@@ -1022,14 +1207,12 @@ async function runUnpacked(rendererDir, arg) {
       // 字体补丁
       if (patcher) s2 = patcher(s2);
 
-      // 配色补丁：追加到设计 token 主文件末尾（先删旧块，保证可重复更新）
-      if (doTheme && isTokenCss(e.path, s2)) {
-        const idx = s2.indexOf('/* ' + THEME_MARK);
-        if (idx >= 0) s2 = s2.slice(0, idx).replace(/\s+$/, '');
-        s2 = s2 + '\n' + CLAUDE_THEME_CSS;
-        themePatched++;
-        themeTargets.push(e.path);
-        modified = true;
+      // 配色 / 字重补丁：挂在设计 token 主文件上，先剥掉旧块再按本次选择重建
+      if ((doTheme || weightCss !== undefined) && isTokenCss(e.path, s2)) {
+        let css = stripPatchedBlocks(s2);
+        if (doTheme) { css = css + '\n' + CLAUDE_THEME_CSS; themePatched++; themeTargets.push(e.path); }
+        if (weightCss) { css = css + '\n' + weightCss; weightPatched++; weightTargets.push(e.path); }
+        if (css !== s2) { s2 = css; modified = true; }
       }
 
       // index.html 里打标记，用于识别"已 patch"状态
@@ -1052,11 +1235,13 @@ async function runUnpacked(rendererDir, arg) {
   console.log('共 ' + entries.length + ' 个文件');
   if (F) console.log('字体已修改: ' + fontPatched + ' 个文件');
   if (doTheme) console.log('配色挂载点: ' + (themeTargets.length ? themeTargets.join(', ') : '❌ 未找到'));
+  if (weightCss !== undefined) console.log('字重挂载点: ' + (weightTargets.length ? weightTargets.join(', ') : '❌ 未找到'));
 
-  if (fontPatched === 0 && themePatched === 0) {
+  if (fontPatched === 0 && themePatched === 0 && weightPatched === 0 && weightCss !== '') {
     console.error('\n✗ 没有做任何修改。');
     if (F) console.error('  字体规则没命中 → WorkBuddy 的 UI 结构可能又变了。');
     if (doTheme) console.error('  没找到设计 token 文件（含 --wb-palette-brand-8 定义的 CSS）→ 配色挂载点又变了。');
+    if (weightCss) console.error('  没找到设计 token 文件 → 字重挂载点又变了。');
     console.error('  请把上面的信息反馈给脚本作者，或运行 check 模式查看体检结果。');
     process.exit(1);
   }
@@ -1097,12 +1282,14 @@ async function runUnpacked(rendererDir, arg) {
   saveConfig({
     font: F ? fontInput.trim() : '',
     theme: doTheme,
+    weight: weightOpt || '',
     savedAt: new Date().toISOString(),
   });
 
   console.log('\n✓ 替换完成！请重新打开 WorkBuddy。');
   if (F) console.log('  字体已更换为 ' + F.trim() + '。');
   if (doTheme) console.log('  配色已改为 Claude 暖色。');
+  if (weightOpt) console.log('  字重已设为 ' + (weightOpt === 'regular' ? '官方默认' : weightOpt) + '。');
   console.log('  设置已记住。以后 WorkBuddy 更新后，双击「一键恢复.bat」即可全部恢复。');
   console.log('  如需还原，运行：node workbuddy-font-patcher.js restore');
   console.log('  如需体检，运行：node workbuddy-font-patcher.js check');

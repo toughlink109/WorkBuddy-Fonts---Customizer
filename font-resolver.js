@@ -8,96 +8,30 @@
  *   浏览器优先用 nid=16。填 nid=1 的名字浏览器【认不出来】，会静默回退默认字体。
  *   本脚本以 nid=16 为「推荐值」优先输出。
  *
+ * 同时输出每个家族实际装了几档字重（--weight 只能选到真实存在的字面）。
+ *
  * 用法：
  *   node font-resolver.js                 列出所有可用的中文/自定义字体家族名
- *   node font-resolver.js 仓耳今楷         按关键词模糊匹配，输出真实家族名
- *   node font-resolver.js --verify 名字     用真实浏览器内核验证该名字是否生效（需 Edge/Chrome）
+ *   node font-resolver.js 仓耳今楷         按关键词模糊匹配，输出真实家族名与字重
  */
-const fs = require('fs');
-const path = require('path');
+const { scanInstalledFamilies, weightLabel } = require('./font-meta');
 
-const FONT_DIRS = [
-  'C:\\Windows\\Fonts',
-  path.join(process.env.LOCALAPPDATA || 'C:\\Users\\Default\\AppData\\Local',
-            'Microsoft', 'Windows', 'Fonts'),
-];
-
-function utf16beToString(buf) {
-  if (buf.length % 2 !== 0) return '';
-  const sw = Buffer.from(buf);
-  sw.swap16();
-  return sw.toString('utf16le');
-}
-
-// 返回 { fam1:Set(nid=1), fam16:Set(nid=16), fam4:Set(nid=4) }
-function parseFamilies(file) {
-  let buf;
-  try {
-    const st = fs.statSync(file);
-    if (st.size > 120 * 1024 * 1024) return null;   // 跳过超大文件
-    buf = fs.readFileSync(file);
-  } catch { return null; }
-
-  const tag = buf.toString('latin1', 0, 4);
-  // ttf/otf: 0x00010000 / 'OTTO' / 'true' / 'typ1'
-  const isSFNT = tag === 'OTTO' || tag === 'true' || tag === 'typ1' ||
-                 buf.readUInt32BE(0) === 0x00010000;
-  if (!isSFNT) return null;                        // ttc 等暂不处理
-
-  const numTables = buf.readUInt16BE(4);
-  let nameOff = -1;
-  for (let i = 0; i < numTables; i++) {
-    const rec = 12 + i * 16;
-    if (rec + 16 > buf.length) break;
-    if (buf.toString('latin1', rec, rec + 4) === 'name') {
-      nameOff = buf.readUInt32BE(rec + 8);
-      break;
-    }
-  }
-  if (nameOff < 0 || nameOff + 6 > buf.length) return null;
-
-  const count = buf.readUInt16BE(nameOff + 2);
-  const strOff = buf.readUInt16BE(nameOff + 4);
-  const fam1 = new Set(), fam16 = new Set(), fam4 = new Set();
-
-  for (let i = 0; i < count; i++) {
-    const r = nameOff + 6 + i * 12;
-    if (r + 12 > buf.length) break;
-    const pid = buf.readUInt16BE(r);
-    const nid = buf.readUInt16BE(r + 6);
-    const len = buf.readUInt16BE(r + 8);
-    const off = buf.readUInt16BE(r + 10);
-    if (nid !== 1 && nid !== 16 && nid !== 4) continue;
-
-    const s = buf.slice(nameOff + strOff + off, nameOff + strOff + off + len);
-    let t;
-    if (pid === 3 || pid === 0) t = utf16beToString(s);
-    else t = s.toString('latin1');
-    t = (t || '').replace(/\0/g, '').trim();
-    if (!t || t.length >= 80) continue;
-    if (nid === 1) fam1.add(t);
-    else if (nid === 16) fam16.add(t);
-    else fam4.add(t);
-  }
-  if (!fam1.size && !fam16.size) return null;
-  return { fam1, fam16, fam4 };
-}
-
+// 汇总为：家族名 -> { file, src, weights }
 function scanAll() {
-  const all = new Map();   // 家族名 -> {file, src}
-  for (const dir of FONT_DIRS) {
-    let files = [];
-    try { files = fs.readdirSync(dir); } catch { continue; }
-    for (const f of files) {
-      if (!/\.(ttf|otf)$/i.test(f)) continue;
-      const r = parseFamilies(path.join(dir, f));
-      if (!r) continue;
-      // nid=16 优先登记（浏览器用名），再补 nid=1
-      for (const fam of r.fam16) if (!all.has(fam)) all.set(fam, { file: f, src: 'nid16' });
-      for (const fam of r.fam1) if (!all.has(fam)) all.set(fam, { file: f, src: 'nid1' });
-    }
+  const all = new Map();
+  for (const [name, item] of scanInstalledFamilies()) {
+    const files = [...item.files];
+    all.set(name, {
+      file: files[0] + (files.length > 1 ? ` 等 ${files.length} 个文件` : ''),
+      src: item.src,
+      weights: [...item.weights].sort((a, b) => a - b),
+    });
   }
   return all;
+}
+
+function weightText(weights) {
+  return weights.length ? weights.map(weightLabel).join(' / ') : '未知';
 }
 
 const argv = process.argv.slice(2);
@@ -112,7 +46,7 @@ if (!kw) {
   console.log(`=== 含中文的字体家族名 (${cn.length} 个) ===`);
   cn.forEach(n => {
     const v = all.get(n);
-    console.log(`  ${n}${v.src === 'nid16' ? '   ★浏览器用名' : ''}    [${v.file}]`);
+    console.log(`  ${n}${v.src === 'nid16' ? '   ★浏览器用名' : ''}   [字重 ${weightText(v.weights)}]   [${v.file}]`);
   });
   console.log('\n★ = 浏览器(Chromium)实际认的名字，优先填这个。');
 } else {
@@ -132,9 +66,11 @@ if (!kw) {
     hits.forEach(n => {
       const v = all.get(n);
       const tag = v.src === 'nid16' ? '   ★浏览器用名（推荐填这个）' : '   ⚠ GDI 注册表名（浏览器可能认不出）';
-      console.log(`  ${n}${tag}    [${v.file}]`);
+      console.log(`  ${n}${tag}`);
+      console.log(`      字重: ${weightText(v.weights)}    [${v.file}]`);
     });
   }
   console.log('\n提示：优先填带「★浏览器用名」的那个。带 ⚠ 的名字 GDI 认、但浏览器可能认不出，');
   console.log('      会导致字体静默回退（看着改了其实没生效）。');
+  console.log('      字重只有一档的字体，--weight light/bold 不会真的生效（浏览器不合成更细的字重）。');
 }
